@@ -367,7 +367,9 @@ struct cma_work {
 union cma_ip_addr {
 	struct in6_addr ip6;
 	struct {
-		__be32 pad[3];
+		__be32 qpn;
+		__be32 qkey;
+		__be32 pad[1];
 		__be32 addr;
 	} ip4;
 };
@@ -3956,9 +3958,14 @@ static int cma_format_hdr(void *hdr, struct rdma_id_private *id_priv)
 		dst4 = (struct sockaddr_in *) cma_dst_addr(id_priv);
 
 		cma_set_ip_ver(cma_hdr, 4);
+		cma_hdr->src_addr.ip4.qpn = id_priv->id.qp->qp_num;
+		cma_hdr->src_addr.ip4.qkey = id_priv->qkey;
 		cma_hdr->src_addr.ip4.addr = src4->sin_addr.s_addr;
+		cma_hdr->dst_addr.ip4.qpn = id_priv->qp_num;
+		cma_hdr->dst_addr.ip4.qkey = id_priv->qkey;
 		cma_hdr->dst_addr.ip4.addr = dst4->sin_addr.s_addr;
 		cma_hdr->port = src4->sin_port;
+
 	} else if (cma_family(id_priv) == AF_INET6) {
 		struct sockaddr_in6 *src6, *dst6;
 
