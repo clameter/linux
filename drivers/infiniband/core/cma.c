@@ -3962,6 +3962,8 @@ static int cma_format_hdr(void *hdr, struct rdma_id_private *id_priv)
 		cma_hdr->src_addr.ip4.sess_qkey = htonl(id_priv->qkey);
 		cma_hdr->src_addr.ip4.sidr_qpn = htonl(1);
 		cma_hdr->src_addr.ip4.addr = src4->sin_addr.s_addr;
+		cma_hdr->dst_addr.ip4.qpn = id_priv->qp_num;
+		cma_hdr->dst_addr.ip4.qkey = id_priv->qkey;
 		cma_hdr->dst_addr.ip4.addr = dst4->sin_addr.s_addr;
 		cma_hdr->port = src4->sin_port;
 
