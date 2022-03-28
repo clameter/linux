@@ -488,8 +488,9 @@ static int copy_src_l2_addr(struct rdma_dev_addr *dev_addr,
 	 * we're definitely in RoCE v2 (as RoCE v1 isn't routable) set the
 	 * network type accordingly.
 	 */
-	if (has_gateway(dst, dst_in->sa_family) &&
-	    ndev->type != ARPHRD_INFINIBAND)
+	dev_addr->gateway = has_gateway(dst, dst_in->sa_family);
+
+	if (dev_addr->gateway && ndev->type != ARPHRD_INFINIBAND)
 		dev_addr->network = dst_in->sa_family == AF_INET ?
 						RDMA_NETWORK_IPV4 :
 						RDMA_NETWORK_IPV6;

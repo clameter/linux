@@ -411,6 +411,28 @@ static ssize_t link_layer_show(struct ib_device *ibdev, u32 port_num,
 	return sysfs_emit(buf, "%s\n", output);
 }
 
+static ssize_t gateway_qp_show(struct ib_device *ibdev, u32 port_num,
+			   struct ib_port_attribute *unused, char *buf)
+{
+	return sysfs_emit(buf, "0x%x\n", ibdev->gateway_qp);
+}
+
+static ssize_t gateway_qp_store(struct ib_device *device, u32 port_num,
+			       struct ib_port_attribute *unused,
+			       const char *buf, size_t count)
+{
+	long qp;
+	int err;
+
+	err = kstrtoul(buf, 10, &qp);
+	if (err)
+		return err;
+
+	device->gateway_qp = qp;
+		
+	return count;
+}
+
 static IB_PORT_ATTR_RO(state);
 static IB_PORT_ATTR_RO(lid);
 static IB_PORT_ATTR_RO(lid_mask_count);
@@ -420,6 +442,7 @@ static IB_PORT_ATTR_RO(cap_mask);
 static IB_PORT_ATTR_RO(rate);
 static IB_PORT_ATTR_RO(phys_state);
 static IB_PORT_ATTR_RO(link_layer);
+static IB_PORT_ATTR_RW(gateway_qp);
 
 static struct attribute *port_default_attrs[] = {
 	&ib_port_attr_state.attr,
@@ -431,6 +454,7 @@ static struct attribute *port_default_attrs[] = {
 	&ib_port_attr_rate.attr,
 	&ib_port_attr_phys_state.attr,
 	&ib_port_attr_link_layer.attr,
+	&ib_port_attr_gateway_qp.attr,
 	NULL
 };
 ATTRIBUTE_GROUPS(port_default);

@@ -4092,6 +4092,10 @@ static int cma_resolve_ib_udp(struct rdma_id_private *id_priv,
 	req.timeout_ms = 1 << (CMA_CM_RESPONSE_TIMEOUT - 8);
 	req.max_cm_retries = CMA_MAX_CM_RETRIES;
 
+	/* If the SIDR REQ is going outside of the subnet then use a different QP number */
+	if (id_priv->id.route.addr.dev_addr.gateway && id_priv->id.device->gateway_qp)
+		id->remote_cm_qpn = id_priv->id.device->gateway_qp;
+
 	trace_cm_send_sidr_req(id_priv);
 	ret = ib_send_cm_sidr_req(id_priv->cm_id.ib, &req);
 	if (ret) {

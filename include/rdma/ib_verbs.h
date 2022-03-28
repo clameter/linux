@@ -2752,6 +2752,7 @@ struct ib_device {
 	struct completion unreg_completion;
 	struct work_struct unregistration_work;
 
+	u32 gateway_qp;
 	const struct rdma_link_ops *link_ops;
 
 	/* Protects compat_devs xarray modifications */
