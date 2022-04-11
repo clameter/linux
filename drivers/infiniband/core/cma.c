@@ -367,10 +367,10 @@ struct cma_work {
 union cma_ip_addr {
 	struct in6_addr ip6;
 	struct {
-		__be32 qpn;
-		__be32 qkey;
-		__be32 pad[1];
-		__be32 addr;
+		__be32 sess_qpn;		/* QPN of the UD session to be established or 0 for not provided */
+		__be32 sess_qkey;		/* QKEY for the UD session to be established or 0 for default */
+		__be32 sidr_qpn;		/* QPN that will take the SIDR REP response or 0 for the default (QP1) */
+		__be32 addr;			/* Source and destination IP address */
 	} ip4;
 };
 
@@ -3958,11 +3958,10 @@ static int cma_format_hdr(void *hdr, struct rdma_id_private *id_priv)
 		dst4 = (struct sockaddr_in *) cma_dst_addr(id_priv);
 
 		cma_set_ip_ver(cma_hdr, 4);
-		cma_hdr->src_addr.ip4.qpn = id_priv->id.qp->qp_num;
-		cma_hdr->src_addr.ip4.qkey = id_priv->qkey;
+		cma_hdr->src_addr.ip4.sess_qpn = htonl(id_priv->qp_keyid.qp);
+		cma_hdr->src_addr.ip4.sess_qkey = htonl(id_priv->qkey);
+		cma_hdr->src_addr.ip4.sidr_qpn = htonl(1);
 		cma_hdr->src_addr.ip4.addr = src4->sin_addr.s_addr;
-		cma_hdr->dst_addr.ip4.qpn = id_priv->qp_num;
-		cma_hdr->dst_addr.ip4.qkey = id_priv->qkey;
 		cma_hdr->dst_addr.ip4.addr = dst4->sin_addr.s_addr;
 		cma_hdr->port = src4->sin_port;
 
