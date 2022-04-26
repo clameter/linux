@@ -3958,7 +3958,7 @@ static int cma_format_hdr(void *hdr, struct rdma_id_private *id_priv)
 		dst4 = (struct sockaddr_in *) cma_dst_addr(id_priv);
 
 		cma_set_ip_ver(cma_hdr, 4);
-		cma_hdr->src_addr.ip4.sess_qpn = htonl(id_priv->qp_keyid.qp);
+		cma_hdr->src_addr.ip4.sess_qpn = htonl(id_priv->qp_num);
 		cma_hdr->src_addr.ip4.sess_qkey = htonl(id_priv->qkey);
 		cma_hdr->src_addr.ip4.sidr_qpn = htonl(1);
 		cma_hdr->src_addr.ip4.addr = src4->sin_addr.s_addr;
@@ -4393,6 +4393,15 @@ static int cma_send_sidr_rep(struct rdma_id_private *id_priv,
 
 		rep.ece.vendor_id = id_priv->ece.vendor_id;
 		rep.ece.attr_mod = id_priv->ece.attr_mod;
+		if (private_data) {
+			const struct cma_hdr *hdr = private_data;
+
+			if (!hdr->cma_version && hdr->ip_version && hdr->src_addr.ip4.sidr_qpn) {
+				printk(KERN_WARNING "Redirection SIDR REP to QP# = %d\n", hdr->src_addr.ip4.sidr_qpn);
+				id_priv->cm_id.ib->remote_cm_qpn = hdr->src_addr.ip4.sidr_qpn;
+			}
+                }
+
 	}
 
 	rep.private_data = private_data;
