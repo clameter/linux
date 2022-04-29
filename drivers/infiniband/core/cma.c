@@ -4396,7 +4396,7 @@ static int cma_send_sidr_rep(struct rdma_id_private *id_priv,
 		if (private_data) {
 			const struct cma_hdr *hdr = private_data;
 
-			if (!hdr->cma_version && hdr->ip_version && hdr->src_addr.ip4.sidr_qpn) {
+			if (!hdr->cma_version && cma_get_ip_ver(hdr) == 4 && hdr->src_addr.ip4.sidr_qpn) {
 				printk(KERN_WARNING "Redirection SIDR REP to QP# = %d\n", hdr->src_addr.ip4.sidr_qpn);
 				id_priv->cm_id.ib->remote_cm_qpn = hdr->src_addr.ip4.sidr_qpn;
 			}
