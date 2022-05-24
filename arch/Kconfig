@@ -24,6 +24,13 @@ config KEXEC_ELF
 config HAVE_IMA_KEXEC
 	bool
 
+config ARCH_HAS_SUBPAGE_FAULTS
+	bool
+	help
+	  Select if the architecture can check permissions at sub-page
+	  granularity (e.g. arm64 MTE). The probe_user_*() functions
+	  must be implemented.
+
 config HOTPLUG_SMT
 	bool
 
@@ -35,6 +42,7 @@ config KPROBES
 	depends on MODULES
 	depends on HAVE_KPROBES
 	select KALLSYMS
+	select TASKS_RCU if PREEMPTION
 	help
 	  Kprobes allows you to trap at almost any kernel address and
 	  execute a callback function.  register_kprobe() establishes
@@ -854,10 +862,8 @@ config HAVE_ARCH_HUGE_VMAP
 
 #
 #  Archs that select this would be capable of PMD-sized vmaps (i.e.,
-#  arch_vmap_pmd_supported() returns true), and they must make no assumptions
-#  that vmalloc memory is mapped with PAGE_SIZE ptes. The VM_NO_HUGE_VMAP flag
-#  can be used to prohibit arch-specific allocations from using hugepages to
-#  help with this (e.g., modules may require it).
+#  arch_vmap_pmd_supported() returns true). The VM_ALLOW_HUGE_VMAP flag
+#  must be used to enable allocations to use hugepages.
 #
 config HAVE_ARCH_HUGE_VMALLOC
 	depends on HAVE_ARCH_HUGE_VMAP

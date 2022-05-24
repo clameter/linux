@@ -1270,8 +1270,8 @@ static void svm_prepare_switch_to_guest(struct kvm_vcpu *vcpu)
 	 */
 	vmsave(__sme_page_pa(sd->save_area));
 	if (sev_es_guest(vcpu->kvm)) {
-		struct vmcb_save_area *hostsa;
-		hostsa = (struct vmcb_save_area *)(page_address(sd->save_area) + 0x400);
+		struct sev_es_save_area *hostsa;
+		hostsa = (struct sev_es_save_area *)(page_address(sd->save_area) + 0x400);
 
 		sev_es_prepare_switch_to_guest(hostsa);
 	}
@@ -3117,8 +3117,8 @@ static void dump_vmcb(struct kvm_vcpu *vcpu)
 	       "tr:",
 	       save01->tr.selector, save01->tr.attrib,
 	       save01->tr.limit, save01->tr.base);
-	pr_err("cpl:            %d                efer:         %016llx\n",
-		save->cpl, save->efer);
+	pr_err("vmpl: %d   cpl:  %d               efer:          %016llx\n",
+	       save->vmpl, save->cpl, save->efer);
 	pr_err("%-15s %016llx %-13s %016llx\n",
 	       "cr0:", save->cr0, "cr2:", save->cr2);
 	pr_err("%-15s %016llx %-13s %016llx\n",
@@ -4620,6 +4620,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.mem_enc_ioctl = sev_mem_enc_ioctl,
 	.mem_enc_register_region = sev_mem_enc_register_region,
 	.mem_enc_unregister_region = sev_mem_enc_unregister_region,
+	.guest_memory_reclaimed = sev_guest_memory_reclaimed,
 
 	.vm_copy_enc_context_from = sev_vm_copy_enc_context_from,
 	.vm_move_enc_context_from = sev_vm_move_enc_context_from,
