@@ -417,7 +417,7 @@ static unsigned long srcu_readers_lock_idx(struct srcu_struct *ssp, int idx)
 	for_each_possible_cpu(cpu) {
 		struct srcu_data *cpuc = per_cpu_ptr(ssp->sda, cpu);
 
-		sum += READ_ONCE(cpuc->srcu_lock_count[idx]);
+		sum += atomic_long_read(&cpuc->srcu_lock_count[idx]);
 	}
 	return sum;
 }
@@ -429,13 +429,18 @@ static unsigned long srcu_readers_lock_idx(struct srcu_struct *ssp, int idx)
 static unsigned long srcu_readers_unlock_idx(struct srcu_struct *ssp, int idx)
 {
 	int cpu;
+	unsigned long mask = 0;
 	unsigned long sum = 0;
 
 	for_each_possible_cpu(cpu) {
 		struct srcu_data *cpuc = per_cpu_ptr(ssp->sda, cpu);
 
-		sum += READ_ONCE(cpuc->srcu_unlock_count[idx]);
+		sum += atomic_long_read(&cpuc->srcu_unlock_count[idx]);
+		if (IS_ENABLED(CONFIG_PROVE_RCU))
+			mask = mask | READ_ONCE(cpuc->srcu_nmi_safety);
 	}
+	WARN_ONCE(IS_ENABLED(CONFIG_PROVE_RCU) && (mask & (mask >> 1)),
+		  "Mixed NMI-safe readers for srcu_struct at %ps.\n", ssp);
 	return sum;
 }
 
@@ -503,18 +508,60 @@ static bool srcu_readers_active(struct srcu_struct *ssp)
 	for_each_possible_cpu(cpu) {
 		struct srcu_data *cpuc = per_cpu_ptr(ssp->sda, cpu);
 
-		sum += READ_ONCE(cpuc->srcu_lock_count[0]);
-		sum += READ_ONCE(cpuc->srcu_lock_count[1]);
-		sum -= READ_ONCE(cpuc->srcu_unlock_count[0]);
-		sum -= READ_ONCE(cpuc->srcu_unlock_count[1]);
+		sum += atomic_long_read(&cpuc->srcu_lock_count[0]);
+		sum += atomic_long_read(&cpuc->srcu_lock_count[1]);
+		sum -= atomic_long_read(&cpuc->srcu_unlock_count[0]);
+		sum -= atomic_long_read(&cpuc->srcu_unlock_count[1]);
 	}
 	return sum;
 }
 
-#define SRCU_INTERVAL		1	// Base delay if no expedited GPs pending.
-#define SRCU_MAX_INTERVAL	10	// Maximum incremental delay from slow readers.
-#define SRCU_MAX_NODELAY_PHASE	1	// Maximum per-GP-phase consecutive no-delay instances.
-#define SRCU_MAX_NODELAY	100	// Maximum consecutive no-delay instances.
+/*
+ * We use an adaptive strategy for synchronize_srcu() and especially for
+ * synchronize_srcu_expedited().  We spin for a fixed time period
+ * (defined below, boot time configurable) to allow SRCU readers to exit
+ * their read-side critical sections.  If there are still some readers
+ * after one jiffy, we repeatedly block for one jiffy time periods.
+ * The blocking time is increased as the grace-period age increases,
+ * with max blocking time capped at 10 jiffies.
+ */
+#define SRCU_DEFAULT_RETRY_CHECK_DELAY		5
+
+static ulong srcu_retry_check_delay = SRCU_DEFAULT_RETRY_CHECK_DELAY;
+module_param(srcu_retry_check_delay, ulong, 0444);
+
+#define SRCU_INTERVAL		1		// Base delay if no expedited GPs pending.
+#define SRCU_MAX_INTERVAL	10		// Maximum incremental delay from slow readers.
+
+#define SRCU_DEFAULT_MAX_NODELAY_PHASE_LO	3UL	// Lowmark on default per-GP-phase
+							// no-delay instances.
+#define SRCU_DEFAULT_MAX_NODELAY_PHASE_HI	1000UL	// Highmark on default per-GP-phase
+							// no-delay instances.
+
+#define SRCU_UL_CLAMP_LO(val, low)	((val) > (low) ? (val) : (low))
+#define SRCU_UL_CLAMP_HI(val, high)	((val) < (high) ? (val) : (high))
+#define SRCU_UL_CLAMP(val, low, high)	SRCU_UL_CLAMP_HI(SRCU_UL_CLAMP_LO((val), (low)), (high))
+// per-GP-phase no-delay instances adjusted to allow non-sleeping poll upto
+// one jiffies time duration. Mult by 2 is done to factor in the srcu_get_delay()
+// called from process_srcu().
+#define SRCU_DEFAULT_MAX_NODELAY_PHASE_ADJUSTED	\
+	(2UL * USEC_PER_SEC / HZ / SRCU_DEFAULT_RETRY_CHECK_DELAY)
+
+// Maximum per-GP-phase consecutive no-delay instances.
+#define SRCU_DEFAULT_MAX_NODELAY_PHASE	\
+	SRCU_UL_CLAMP(SRCU_DEFAULT_MAX_NODELAY_PHASE_ADJUSTED,	\
+		      SRCU_DEFAULT_MAX_NODELAY_PHASE_LO,	\
+		      SRCU_DEFAULT_MAX_NODELAY_PHASE_HI)
+
+static ulong srcu_max_nodelay_phase = SRCU_DEFAULT_MAX_NODELAY_PHASE;
+module_param(srcu_max_nodelay_phase, ulong, 0444);
+
+// Maximum consecutive no-delay instances.
+#define SRCU_DEFAULT_MAX_NODELAY	(SRCU_DEFAULT_MAX_NODELAY_PHASE > 100 ?	\
+					 SRCU_DEFAULT_MAX_NODELAY_PHASE : 100)
+
+static ulong srcu_max_nodelay = SRCU_DEFAULT_MAX_NODELAY;
+module_param(srcu_max_nodelay, ulong, 0444);
 
 /*
  * Return grace-period delay, zero if there are expedited grace
@@ -522,16 +569,22 @@ static bool srcu_readers_active(struct srcu_struct *ssp)
  */
 static unsigned long srcu_get_delay(struct srcu_struct *ssp)
 {
+	unsigned long gpstart;
+	unsigned long j;
 	unsigned long jbase = SRCU_INTERVAL;
 
 	if (ULONG_CMP_LT(READ_ONCE(ssp->srcu_gp_seq), READ_ONCE(ssp->srcu_gp_seq_needed_exp)))
 		jbase = 0;
-	if (rcu_seq_state(READ_ONCE(ssp->srcu_gp_seq)))
-		jbase += jiffies - READ_ONCE(ssp->srcu_gp_start);
-	if (!jbase) {
-		WRITE_ONCE(ssp->srcu_n_exp_nodelay, READ_ONCE(ssp->srcu_n_exp_nodelay) + 1);
-		if (READ_ONCE(ssp->srcu_n_exp_nodelay) > SRCU_MAX_NODELAY_PHASE)
-			jbase = 1;
+	if (rcu_seq_state(READ_ONCE(ssp->srcu_gp_seq))) {
+		j = jiffies - 1;
+		gpstart = READ_ONCE(ssp->srcu_gp_start);
+		if (time_after(j, gpstart))
+			jbase += j - gpstart;
+		if (!jbase) {
+			WRITE_ONCE(ssp->srcu_n_exp_nodelay, READ_ONCE(ssp->srcu_n_exp_nodelay) + 1);
+			if (READ_ONCE(ssp->srcu_n_exp_nodelay) > srcu_max_nodelay_phase)
+				jbase = 1;
+		}
 	}
 	return jbase > SRCU_MAX_INTERVAL ? SRCU_MAX_INTERVAL : jbase;
 }
@@ -578,6 +631,29 @@ void cleanup_srcu_struct(struct srcu_struct *ssp)
 }
 EXPORT_SYMBOL_GPL(cleanup_srcu_struct);
 
+#ifdef CONFIG_PROVE_RCU
+/*
+ * Check for consistent NMI safety.
+ */
+void srcu_check_nmi_safety(struct srcu_struct *ssp, bool nmi_safe)
+{
+	int nmi_safe_mask = 1 << nmi_safe;
+	int old_nmi_safe_mask;
+	struct srcu_data *sdp;
+
+	/* NMI-unsafe use in NMI is a bad sign */
+	WARN_ON_ONCE(!nmi_safe && in_nmi());
+	sdp = raw_cpu_ptr(ssp->sda);
+	old_nmi_safe_mask = READ_ONCE(sdp->srcu_nmi_safety);
+	if (!old_nmi_safe_mask) {
+		WRITE_ONCE(sdp->srcu_nmi_safety, nmi_safe_mask);
+		return;
+	}
+	WARN_ONCE(old_nmi_safe_mask != nmi_safe_mask, "CPU %d old state %d new state %d\n", sdp->cpu, old_nmi_safe_mask, nmi_safe_mask);
+}
+EXPORT_SYMBOL_GPL(srcu_check_nmi_safety);
+#endif /* CONFIG_PROVE_RCU */
+
 /*
  * Counts the new reader in the appropriate per-CPU element of the
  * srcu_struct.
@@ -588,7 +664,7 @@ int __srcu_read_lock(struct srcu_struct *ssp)
 	int idx;
 
 	idx = READ_ONCE(ssp->srcu_idx) & 0x1;
-	this_cpu_inc(ssp->sda->srcu_lock_count[idx]);
+	this_cpu_inc(ssp->sda->srcu_lock_count[idx].counter);
 	smp_mb(); /* B */  /* Avoid leaking the critical section. */
 	return idx;
 }
@@ -602,18 +678,44 @@ EXPORT_SYMBOL_GPL(__srcu_read_lock);
 void __srcu_read_unlock(struct srcu_struct *ssp, int idx)
 {
 	smp_mb(); /* C */  /* Avoid leaking the critical section. */
-	this_cpu_inc(ssp->sda->srcu_unlock_count[idx]);
+	this_cpu_inc(ssp->sda->srcu_unlock_count[idx].counter);
 }
 EXPORT_SYMBOL_GPL(__srcu_read_unlock);
 
+#ifdef CONFIG_NEED_SRCU_NMI_SAFE
+
 /*
- * We use an adaptive strategy for synchronize_srcu() and especially for
- * synchronize_srcu_expedited().  We spin for a fixed time period
- * (defined below) to allow SRCU readers to exit their read-side critical
- * sections.  If there are still some readers after a few microseconds,
- * we repeatedly block for 1-millisecond time periods.
+ * Counts the new reader in the appropriate per-CPU element of the
+ * srcu_struct, but in an NMI-safe manner using RMW atomics.
+ * Returns an index that must be passed to the matching srcu_read_unlock().
  */
-#define SRCU_RETRY_CHECK_DELAY		5
+int __srcu_read_lock_nmisafe(struct srcu_struct *ssp)
+{
+	int idx;
+	struct srcu_data *sdp = raw_cpu_ptr(ssp->sda);
+
+	idx = READ_ONCE(ssp->srcu_idx) & 0x1;
+	atomic_long_inc(&sdp->srcu_lock_count[idx]);
+	smp_mb__after_atomic(); /* B */  /* Avoid leaking the critical section. */
+	return idx;
+}
+EXPORT_SYMBOL_GPL(__srcu_read_lock_nmisafe);
+
+/*
+ * Removes the count for the old reader from the appropriate per-CPU
+ * element of the srcu_struct.  Note that this may well be a different
+ * CPU than that which was incremented by the corresponding srcu_read_lock().
+ */
+void __srcu_read_unlock_nmisafe(struct srcu_struct *ssp, int idx)
+{
+	struct srcu_data *sdp = raw_cpu_ptr(ssp->sda);
+
+	smp_mb__before_atomic(); /* C */  /* Avoid leaking the critical section. */
+	atomic_long_inc(&sdp->srcu_unlock_count[idx]);
+}
+EXPORT_SYMBOL_GPL(__srcu_read_unlock_nmisafe);
+
+#endif // CONFIG_NEED_SRCU_NMI_SAFE
 
 /*
  * Start an SRCU grace period.
@@ -700,7 +802,7 @@ static void srcu_schedule_cbs_snp(struct srcu_struct *ssp, struct srcu_node *snp
  */
 static void srcu_gp_end(struct srcu_struct *ssp)
 {
-	unsigned long cbdelay;
+	unsigned long cbdelay = 1;
 	bool cbs;
 	bool last_lvl;
 	int cpu;
@@ -720,7 +822,9 @@ static void srcu_gp_end(struct srcu_struct *ssp)
 	spin_lock_irq_rcu_node(ssp);
 	idx = rcu_seq_state(ssp->srcu_gp_seq);
 	WARN_ON_ONCE(idx != SRCU_STATE_SCAN2);
-	cbdelay = !!srcu_get_delay(ssp);
+	if (ULONG_CMP_LT(READ_ONCE(ssp->srcu_gp_seq), READ_ONCE(ssp->srcu_gp_seq_needed_exp)))
+		cbdelay = 0;
+
 	WRITE_ONCE(ssp->srcu_last_gp_end, ktime_get_mono_fast_ns());
 	rcu_seq_end(&ssp->srcu_gp_seq);
 	gpseq = rcu_seq_current(&ssp->srcu_gp_seq);
@@ -921,12 +1025,16 @@ static void srcu_funnel_gp_start(struct srcu_struct *ssp, struct srcu_data *sdp,
  */
 static bool try_check_zero(struct srcu_struct *ssp, int idx, int trycount)
 {
+	unsigned long curdelay;
+
+	curdelay = !srcu_get_delay(ssp);
+
 	for (;;) {
 		if (srcu_readers_active_idx_check(ssp, idx))
 			return true;
-		if (--trycount + !srcu_get_delay(ssp) <= 0)
+		if ((--trycount + curdelay) <= 0)
 			return false;
-		udelay(SRCU_RETRY_CHECK_DELAY);
+		udelay(srcu_retry_check_delay);
 	}
 }
 
@@ -1045,7 +1153,12 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
 	int ss_state;
 
 	check_init_srcu_struct(ssp);
-	idx = srcu_read_lock(ssp);
+	/*
+	 * While starting a new grace period, make sure we are in an
+	 * SRCU read-side critical section so that the grace-period
+	 * sequence number cannot wrap around in the meantime.
+	 */
+	idx = __srcu_read_lock_nmisafe(ssp);
 	ss_state = smp_load_acquire(&ssp->srcu_size_state);
 	if (ss_state < SRCU_SIZE_WAIT_CALL)
 		sdp = per_cpu_ptr(ssp->sda, 0);
@@ -1078,7 +1191,7 @@ static unsigned long srcu_gp_start_if_needed(struct srcu_struct *ssp,
 		srcu_funnel_gp_start(ssp, sdp, s, do_norm);
 	else if (needexp)
 		srcu_funnel_exp_start(ssp, sdp_mynode, s);
-	srcu_read_unlock(ssp, idx);
+	__srcu_read_unlock_nmisafe(ssp, idx);
 	return s;
 }
 
@@ -1382,13 +1495,13 @@ void srcu_barrier(struct srcu_struct *ssp)
 	/* Initial count prevents reaching zero until all CBs are posted. */
 	atomic_set(&ssp->srcu_barrier_cpu_cnt, 1);
 
-	idx = srcu_read_lock(ssp);
+	idx = __srcu_read_lock_nmisafe(ssp);
 	if (smp_load_acquire(&ssp->srcu_size_state) < SRCU_SIZE_WAIT_BARRIER)
 		srcu_barrier_one_cpu(ssp, per_cpu_ptr(ssp->sda, 0));
 	else
 		for_each_possible_cpu(cpu)
 			srcu_barrier_one_cpu(ssp, per_cpu_ptr(ssp->sda, cpu));
-	srcu_read_unlock(ssp, idx);
+	__srcu_read_unlock_nmisafe(ssp, idx);
 
 	/* Remove the initial count, at which point reaching zero can happen. */
 	if (atomic_dec_and_test(&ssp->srcu_barrier_cpu_cnt))
@@ -1582,7 +1695,7 @@ static void process_srcu(struct work_struct *work)
 		j = jiffies;
 		if (READ_ONCE(ssp->reschedule_jiffies) == j) {
 			WRITE_ONCE(ssp->reschedule_count, READ_ONCE(ssp->reschedule_count) + 1);
-			if (READ_ONCE(ssp->reschedule_count) > SRCU_MAX_NODELAY)
+			if (READ_ONCE(ssp->reschedule_count) > srcu_max_nodelay)
 				curdelay = 1;
 		} else {
 			WRITE_ONCE(ssp->reschedule_count, 1);
@@ -1642,8 +1755,8 @@ void srcu_torture_stats_print(struct srcu_struct *ssp, char *tt, char *tf)
 			struct srcu_data *sdp;
 
 			sdp = per_cpu_ptr(ssp->sda, cpu);
-			u0 = data_race(sdp->srcu_unlock_count[!idx]);
-			u1 = data_race(sdp->srcu_unlock_count[idx]);
+			u0 = data_race(atomic_long_read(&sdp->srcu_unlock_count[!idx]));
+			u1 = data_race(atomic_long_read(&sdp->srcu_unlock_count[idx]));
 
 			/*
 			 * Make sure that a lock is always counted if the corresponding
@@ -1651,8 +1764,8 @@ void srcu_torture_stats_print(struct srcu_struct *ssp, char *tt, char *tf)
 			 */
 			smp_rmb();
 
-			l0 = data_race(sdp->srcu_lock_count[!idx]);
-			l1 = data_race(sdp->srcu_lock_count[idx]);
+			l0 = data_race(atomic_long_read(&sdp->srcu_lock_count[!idx]));
+			l1 = data_race(atomic_long_read(&sdp->srcu_lock_count[idx]));
 
 			c0 = l0 - u0;
 			c1 = l1 - u1;
@@ -1674,6 +1787,11 @@ static int __init srcu_bootup_announce(void)
 	pr_info("Hierarchical SRCU implementation.\n");
 	if (exp_holdoff != DEFAULT_SRCU_EXP_HOLDOFF)
 		pr_info("\tNon-default auto-expedite holdoff of %lu ns.\n", exp_holdoff);
+	if (srcu_retry_check_delay != SRCU_DEFAULT_RETRY_CHECK_DELAY)
+		pr_info("\tNon-default retry check delay of %lu us.\n", srcu_retry_check_delay);
+	if (srcu_max_nodelay != SRCU_DEFAULT_MAX_NODELAY)
+		pr_info("\tNon-default max no-delay of %lu.\n", srcu_max_nodelay);
+	pr_info("\tMax phase no-delay instances is %lu.\n", srcu_max_nodelay_phase);
 	return 0;
 }
 early_initcall(srcu_bootup_announce);

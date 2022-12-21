@@ -11,6 +11,8 @@
  */
 
 #include <dt-bindings/pinctrl/apple.h>
+
+#include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/gpio/driver.h>
 #include <linux/interrupt.h>
@@ -18,10 +20,11 @@
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
-#include <linux/pinctrl/pinctrl.h>
-#include <linux/pinctrl/pinmux.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
+
+#include <linux/pinctrl/pinctrl.h>
+#include <linux/pinctrl/pinmux.h>
 
 #include "pinctrl-utils.h"
 #include "core.h"
@@ -71,6 +74,7 @@ struct regmap_config regmap_config = {
 	.max_register = 512 * sizeof(u32),
 	.num_reg_defaults_raw = 512,
 	.use_relaxed_mmio = true,
+	.use_raw_spinlock = true,
 };
 
 /* No locking needed to mask/unmask IRQs as the interrupt mode is per pin-register. */
@@ -509,6 +513,7 @@ static const struct of_device_id apple_gpio_pinctrl_of_match[] = {
 	{ .compatible = "apple,pinctrl", },
 	{ }
 };
+MODULE_DEVICE_TABLE(of, apple_gpio_pinctrl_of_match);
 
 static struct platform_driver apple_gpio_pinctrl_driver = {
 	.driver = {

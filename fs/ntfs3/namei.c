@@ -208,7 +208,7 @@ static int ntfs_mkdir(struct user_namespace *mnt_userns, struct inode *dir,
 }
 
 /*
- * ntfs_rmdir - inode_operations::rm_dir
+ * ntfs_rmdir - inode_operations::rmdir
  */
 static int ntfs_rmdir(struct inode *dir, struct dentry *dentry)
 {
@@ -308,9 +308,7 @@ static int ntfs_rename(struct user_namespace *mnt_userns, struct inode *dir,
 	err = ni_rename(dir_ni, new_dir_ni, ni, de, new_de, &is_bad);
 	if (is_bad) {
 		/* Restore after failed rename failed too. */
-		make_bad_inode(inode);
-		ntfs_inode_err(inode, "failed to undo rename");
-		ntfs_set_state(sbi, NTFS_DIRTY_ERROR);
+		_ntfs_bad_inode(inode);
 	} else if (!err) {
 		inode->i_ctime = dir->i_ctime = dir->i_mtime =
 			current_time(dir);
@@ -369,7 +367,7 @@ const struct inode_operations ntfs_dir_inode_operations = {
 	.mknod		= ntfs_mknod,
 	.rename		= ntfs_rename,
 	.permission	= ntfs_permission,
-	.get_acl	= ntfs_get_acl,
+	.get_inode_acl	= ntfs_get_acl,
 	.set_acl	= ntfs_set_acl,
 	.setattr	= ntfs3_setattr,
 	.getattr	= ntfs_getattr,
@@ -381,7 +379,7 @@ const struct inode_operations ntfs_special_inode_operations = {
 	.setattr	= ntfs3_setattr,
 	.getattr	= ntfs_getattr,
 	.listxattr	= ntfs_listxattr,
-	.get_acl	= ntfs_get_acl,
+	.get_inode_acl	= ntfs_get_acl,
 	.set_acl	= ntfs_set_acl,
 };
 // clang-format on

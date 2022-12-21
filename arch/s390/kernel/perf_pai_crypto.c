@@ -35,9 +35,9 @@ struct pai_userdata {
 struct paicrypt_map {
 	unsigned long *page;		/* Page for CPU to store counters */
 	struct pai_userdata *save;	/* Page to store no-zero counters */
-	unsigned int users;		/* # of PAI crypto users */
-	unsigned int sampler;		/* # of PAI crypto samplers */
-	unsigned int counter;		/* # of PAI crypto counters */
+	unsigned int active_events;	/* # of PAI crypto users */
+	unsigned int refcnt;		/* Reference count mapped buffers */
+	enum paievt_mode mode;		/* Type of event */
 	struct perf_event *event;	/* Perf event for sampling */
 };
 
@@ -56,15 +56,11 @@ static void paicrypt_event_destroy(struct perf_event *event)
 	cpump->event = NULL;
 	static_branch_dec(&pai_key);
 	mutex_lock(&pai_reserve_mutex);
-	if (event->attr.sample_period)
-		cpump->sampler -= 1;
-	else
-		cpump->counter -= 1;
-	debug_sprintf_event(cfm_dbg, 5, "%s event %#llx cpu %d"
-			    " sampler %d counter %d\n", __func__,
-			    event->attr.config, event->cpu, cpump->sampler,
-			    cpump->counter);
-	if (!cpump->counter && !cpump->sampler) {
+	debug_sprintf_event(cfm_dbg, 5, "%s event %#llx cpu %d users %d"
+			    " mode %d refcnt %d\n", __func__,
+			    event->attr.config, event->cpu,
+			    cpump->active_events, cpump->mode, cpump->refcnt);
+	if (!--cpump->refcnt) {
 		debug_sprintf_event(cfm_dbg, 4, "%s page %#lx save %p\n",
 				    __func__, (unsigned long)cpump->page,
 				    cpump->save);
@@ -72,6 +68,7 @@ static void paicrypt_event_destroy(struct perf_event *event)
 		cpump->page = NULL;
 		kvfree(cpump->save);
 		cpump->save = NULL;
+		cpump->mode = PAI_MODE_NONE;
 	}
 	mutex_unlock(&pai_reserve_mutex);
 }
@@ -136,17 +133,14 @@ static u64 paicrypt_getall(struct perf_event *event)
  */
 static int paicrypt_busy(struct perf_event_attr *a, struct paicrypt_map *cpump)
 {
-	unsigned int *use_ptr;
 	int rc = 0;
 
 	mutex_lock(&pai_reserve_mutex);
 	if (a->sample_period) {		/* Sampling requested */
-		use_ptr = &cpump->sampler;
-		if (cpump->counter || cpump->sampler)
+		if (cpump->mode != PAI_MODE_NONE)
 			rc = -EBUSY;	/* ... sampling/counting active */
 	} else {			/* Counting requested */
-		use_ptr = &cpump->counter;
-		if (cpump->sampler)
+		if (cpump->mode == PAI_MODE_SAMPLING)
 			rc = -EBUSY;	/* ... and sampling active */
 	}
 	if (rc)
@@ -172,12 +166,16 @@ static int paicrypt_busy(struct perf_event_attr *a, struct paicrypt_map *cpump)
 	rc = 0;
 
 unlock:
-	/* If rc is non-zero, do not increment counter/sampler. */
-	if (!rc)
-		*use_ptr += 1;
-	debug_sprintf_event(cfm_dbg, 5, "%s sample_period %#llx sampler %d"
-			    " counter %d page %#lx save %p rc %d\n", __func__,
-			    a->sample_period, cpump->sampler, cpump->counter,
+	/* If rc is non-zero, do not set mode and reference count */
+	if (!rc) {
+		cpump->refcnt++;
+		cpump->mode = a->sample_period ? PAI_MODE_SAMPLING
+					       : PAI_MODE_COUNTING;
+	}
+	debug_sprintf_event(cfm_dbg, 5, "%s sample_period %#llx users %d"
+			    " mode %d refcnt %d page %#lx save %p rc %d\n",
+			    __func__, a->sample_period, cpump->active_events,
+			    cpump->mode, cpump->refcnt,
 			    (unsigned long)cpump->page, cpump->save, rc);
 	mutex_unlock(&pai_reserve_mutex);
 	return rc;
@@ -193,8 +191,9 @@ static int paicrypt_event_init(struct perf_event *event)
 	/* PAI crypto PMU registered as PERF_TYPE_RAW, check event type */
 	if (a->type != PERF_TYPE_RAW && event->pmu->type != a->type)
 		return -ENOENT;
-	/* PAI crypto event must be valid */
-	if (a->config > PAI_CRYPTO_BASE + paicrypt_cnt)
+	/* PAI crypto event must be in valid range */
+	if (a->config < PAI_CRYPTO_BASE ||
+	    a->config > PAI_CRYPTO_BASE + paicrypt_cnt)
 		return -EINVAL;
 	/* Allow only CPU wide operation, no process context for now. */
 	if (event->hw.target || event->cpu == -1)
@@ -208,6 +207,12 @@ static int paicrypt_event_init(struct perf_event *event)
 	if (rc)
 		return rc;
 
+	/* Event initialization sets last_tag to 0. When later on the events
+	 * are deleted and re-added, do not reset the event count value to zero.
+	 * Events are added, deleted and re-added when 2 or more events
+	 * are active at the same time.
+	 */
+	event->hw.last_tag = 0;
 	cpump->event = event;
 	event->destroy = paicrypt_event_destroy;
 
@@ -242,9 +247,12 @@ static void paicrypt_start(struct perf_event *event, int flags)
 {
 	u64 sum;
 
-	sum = paicrypt_getall(event);		/* Get current value */
-	local64_set(&event->hw.prev_count, sum);
-	local64_set(&event->count, 0);
+	if (!event->hw.last_tag) {
+		event->hw.last_tag = 1;
+		sum = paicrypt_getall(event);		/* Get current value */
+		local64_set(&event->count, 0);
+		local64_set(&event->hw.prev_count, sum);
+	}
 }
 
 static int paicrypt_add(struct perf_event *event, int flags)
@@ -252,7 +260,7 @@ static int paicrypt_add(struct perf_event *event, int flags)
 	struct paicrypt_map *cpump = this_cpu_ptr(&paicrypt_map);
 	unsigned long ccd;
 
-	if (cpump->users++ == 0) {
+	if (++cpump->active_events == 1) {
 		ccd = virt_to_phys(cpump->page) | PAI_CRYPTO_KERNEL_OFFSET;
 		WRITE_ONCE(S390_lowcore.ccd, ccd);
 		__ctl_set_bit(0, 50);
@@ -283,7 +291,7 @@ static void paicrypt_del(struct perf_event *event, int flags)
 	if (!event->attr.sample_period)
 		/* Only counting needs to read counter */
 		paicrypt_stop(event, PERF_EF_UPDATE);
-	if (cpump->users-- == 1) {
+	if (--cpump->active_events == 0) {
 		__ctl_clear_bit(0, 50);
 		WRITE_ONCE(S390_lowcore.ccd, 0);
 	}
@@ -356,6 +364,7 @@ static int paicrypt_push_sample(void)
 		raw.frag.data = cpump->save;
 		raw.size = raw.frag.size;
 		data.raw = &raw;
+		data.sample_flags |= PERF_SAMPLE_RAW;
 	}
 
 	overflow = perf_event_overflow(event, &data, &regs);
@@ -368,7 +377,7 @@ static int paicrypt_push_sample(void)
 /* Called on schedule-in and schedule-out. No access to event structure,
  * but for sampling only event CRYPTO_ALL is allowed.
  */
-static void paicrypt_sched_task(struct perf_event_context *ctx, bool sched_in)
+static void paicrypt_sched_task(struct perf_event_pmu_context *pmu_ctx, bool sched_in)
 {
 	/* We started with a clean page on event installation. So read out
 	 * results on schedule_out and if page was dirty, clear values.

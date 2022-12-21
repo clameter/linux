@@ -33,7 +33,7 @@ function expect_fields(nf) {
 # Print a CPP macro definition, padded with spaces so that the macro bodies
 # line up in a column
 function define(name, val) {
-	printf "%-48s%s\n", "#define " name, val
+	printf "%-56s%s\n", "#define " name, val
 }
 
 # Print standard BITMASK/SHIFT/WIDTH CPP definitions for a field
@@ -88,7 +88,7 @@ END {
 
 # skip blank lines and comment lines
 /^$/ { next }
-/^#/ { next }
+/^[\t ]*#/ { next }
 
 /^SysregFields/ {
 	change_block("SysregFields", "None", "SysregFields")
@@ -253,7 +253,7 @@ END {
 	next
 }
 
-/0b[01]+/ && block = "Enum" {
+/0b[01]+/ && block == "Enum" {
 	expect_fields(2)
 	val = $1
 	name = $2

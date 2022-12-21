@@ -4,8 +4,8 @@
  * Copyright © 2008,2010 Intel Corporation
  */
 
-#include <linux/intel-iommu.h>
 #include <linux/dma-resv.h>
+#include <linux/highmem.h>
 #include <linux/sync_file.h>
 #include <linux/uaccess.h>
 
@@ -30,6 +30,7 @@
 #include "i915_gem_context.h"
 #include "i915_gem_evict.h"
 #include "i915_gem_ioctls.h"
+#include "i915_reg.h"
 #include "i915_trace.h"
 #include "i915_user_extensions.h"
 
@@ -53,13 +54,13 @@ enum {
 #define DBG_FORCE_RELOC 0 /* choose one of the above! */
 };
 
-/* __EXEC_OBJECT_NO_RESERVE is BIT(31), defined in i915_vma.h */
-#define __EXEC_OBJECT_HAS_PIN		BIT(30)
-#define __EXEC_OBJECT_HAS_FENCE		BIT(29)
-#define __EXEC_OBJECT_USERPTR_INIT	BIT(28)
-#define __EXEC_OBJECT_NEEDS_MAP		BIT(27)
-#define __EXEC_OBJECT_NEEDS_BIAS	BIT(26)
-#define __EXEC_OBJECT_INTERNAL_FLAGS	(~0u << 26) /* all of the above + */
+/* __EXEC_OBJECT_ flags > BIT(29) defined in i915_vma.h */
+#define __EXEC_OBJECT_HAS_PIN		BIT(29)
+#define __EXEC_OBJECT_HAS_FENCE		BIT(28)
+#define __EXEC_OBJECT_USERPTR_INIT	BIT(27)
+#define __EXEC_OBJECT_NEEDS_MAP		BIT(26)
+#define __EXEC_OBJECT_NEEDS_BIAS	BIT(25)
+#define __EXEC_OBJECT_INTERNAL_FLAGS	(~0u << 25) /* all of the above + */
 #define __EXEC_OBJECT_RESERVED (__EXEC_OBJECT_HAS_PIN | __EXEC_OBJECT_HAS_FENCE)
 
 #define __EXEC_HAS_RELOC	BIT(31)
@@ -998,11 +999,10 @@ static int eb_validate_vmas(struct i915_execbuffer *eb)
 			}
 		}
 
-		if (!(ev->flags & EXEC_OBJECT_WRITE)) {
-			err = dma_resv_reserve_shared(vma->obj->base.resv, 1);
-			if (err)
-				return err;
-		}
+		/* Reserve enough slots to accommodate composite fences */
+		err = dma_resv_reserve_fences(vma->obj->base.resv, eb->num_batches);
+		if (err)
+			return err;
 
 		GEM_BUG_ON(drm_mm_node_allocated(&vma->node) &&
 			   eb_vma_misplaced(&eb->exec[i], vma, ev->flags));
@@ -1320,10 +1320,8 @@ static void *reloc_vaddr(struct i915_vma *vma,
 static void clflush_write32(u32 *addr, u32 value, unsigned int flushes)
 {
 	if (unlikely(flushes & (CLFLUSH_BEFORE | CLFLUSH_AFTER))) {
-		if (flushes & CLFLUSH_BEFORE) {
-			clflushopt(addr);
-			mb();
-		}
+		if (flushes & CLFLUSH_BEFORE)
+			drm_clflush_virt_range(addr, sizeof(*addr));
 
 		*addr = value;
 
@@ -1335,7 +1333,7 @@ static void clflush_write32(u32 *addr, u32 value, unsigned int flushes)
 		 * to ensure ordering of clflush wrt to the system.
 		 */
 		if (flushes & CLFLUSH_AFTER)
-			clflushopt(addr);
+			drm_clflush_virt_range(addr, sizeof(*addr));
 	} else
 		*addr = value;
 }
@@ -1953,7 +1951,7 @@ eb_find_first_request_added(struct i915_execbuffer *eb)
 #if IS_ENABLED(CONFIG_DRM_I915_CAPTURE_ERROR)
 
 /* Stage with GFP_KERNEL allocations before we enter the signaling critical path */
-static void eb_capture_stage(struct i915_execbuffer *eb)
+static int eb_capture_stage(struct i915_execbuffer *eb)
 {
 	const unsigned int count = eb->buffer_count;
 	unsigned int i = count, j;
@@ -1965,6 +1963,10 @@ static void eb_capture_stage(struct i915_execbuffer *eb)
 
 		if (!(flags & EXEC_OBJECT_CAPTURE))
 			continue;
+
+		if (i915_gem_context_is_recoverable(eb->gem_context) &&
+		    (IS_DGFX(eb->i915) || GRAPHICS_VER_FULL(eb->i915) > IP_VER(12, 0)))
+			return -EINVAL;
 
 		for_each_batch_create_order(eb, j) {
 			struct i915_capture_list *capture;
@@ -1978,6 +1980,8 @@ static void eb_capture_stage(struct i915_execbuffer *eb)
 			eb->capture_lists[j] = capture;
 		}
 	}
+
+	return 0;
 }
 
 /* Commit once we're in the critical path */
@@ -2019,8 +2023,9 @@ static void eb_capture_list_clear(struct i915_execbuffer *eb)
 
 #else
 
-static void eb_capture_stage(struct i915_execbuffer *eb)
+static int eb_capture_stage(struct i915_execbuffer *eb)
 {
+	return 0;
 }
 
 static void eb_capture_commit(struct i915_execbuffer *eb)
@@ -2097,7 +2102,8 @@ static int eb_move_to_gpu(struct i915_execbuffer *eb)
 						       eb->composite_fence ?
 						       eb->composite_fence :
 						       &eb->requests[j]->fence,
-						       flags | __EXEC_OBJECT_NO_RESERVE);
+						       flags | __EXEC_OBJECT_NO_RESERVE |
+						       __EXEC_OBJECT_NO_REQUEST_AWAIT);
 		}
 	}
 
@@ -2144,7 +2150,8 @@ err_skip:
 	return err;
 }
 
-static int i915_gem_check_execbuffer(struct drm_i915_gem_execbuffer2 *exec)
+static int i915_gem_check_execbuffer(struct drm_i915_private *i915,
+				     struct drm_i915_gem_execbuffer2 *exec)
 {
 	if (exec->flags & __I915_EXEC_ILLEGAL_FLAGS)
 		return -EINVAL;
@@ -2157,7 +2164,7 @@ static int i915_gem_check_execbuffer(struct drm_i915_gem_execbuffer2 *exec)
 	}
 
 	if (exec->DR4 == 0xffffffff) {
-		DRM_DEBUG("UXA submitting garbage DR4, fixing up\n");
+		drm_dbg(&i915->drm, "UXA submitting garbage DR4, fixing up\n");
 		exec->DR4 = 0;
 	}
 	if (exec->DR1 || exec->DR4)
@@ -2301,7 +2308,7 @@ static int eb_parse(struct i915_execbuffer *eb)
 	if (IS_ERR(batch))
 		return PTR_ERR(batch);
 
-	err = dma_resv_reserve_shared(shadow->obj->base.resv, 1);
+	err = dma_resv_reserve_fences(shadow->obj->base.resv, 1);
 	if (err)
 		return err;
 
@@ -2420,7 +2427,7 @@ gen8_dispatch_bsd_engine(struct drm_i915_private *dev_priv,
 	/* Check whether the file_priv has already selected one ring. */
 	if ((int)file_priv->bsd_engine < 0)
 		file_priv->bsd_engine =
-			get_random_int() % num_vcs_engines(dev_priv);
+			get_random_u32_below(num_vcs_engines(dev_priv));
 
 	return file_priv->bsd_engine;
 }
@@ -2689,6 +2696,11 @@ eb_select_engine(struct i915_execbuffer *eb)
 	if (err)
 		goto err;
 
+	if (!i915_vm_tryget(ce->vm)) {
+		err = -ENOENT;
+		goto err;
+	}
+
 	eb->context = ce;
 	eb->gt = ce->engine->gt;
 
@@ -2712,6 +2724,7 @@ eb_put_engine(struct i915_execbuffer *eb)
 {
 	struct intel_context *child;
 
+	i915_vm_put(eb->context->vm);
 	intel_gt_pm_put(eb->gt);
 	for_each_child(eb->context, child)
 		intel_context_put(child);
@@ -2789,7 +2802,8 @@ add_timeline_fence_array(struct i915_execbuffer *eb,
 
 		syncobj = drm_syncobj_find(eb->file, user_fence.handle);
 		if (!syncobj) {
-			DRM_DEBUG("Invalid syncobj handle provided\n");
+			drm_dbg(&eb->i915->drm,
+				"Invalid syncobj handle provided\n");
 			return -ENOENT;
 		}
 
@@ -2797,7 +2811,8 @@ add_timeline_fence_array(struct i915_execbuffer *eb,
 
 		if (!fence && user_fence.flags &&
 		    !(user_fence.flags & I915_EXEC_FENCE_SIGNAL)) {
-			DRM_DEBUG("Syncobj handle has no fence\n");
+			drm_dbg(&eb->i915->drm,
+				"Syncobj handle has no fence\n");
 			drm_syncobj_put(syncobj);
 			return -EINVAL;
 		}
@@ -2806,7 +2821,9 @@ add_timeline_fence_array(struct i915_execbuffer *eb,
 			err = dma_fence_chain_find_seqno(&fence, point);
 
 		if (err && !(user_fence.flags & I915_EXEC_FENCE_SIGNAL)) {
-			DRM_DEBUG("Syncobj handle missing requested point %llu\n", point);
+			drm_dbg(&eb->i915->drm,
+				"Syncobj handle missing requested point %llu\n",
+				point);
 			dma_fence_put(fence);
 			drm_syncobj_put(syncobj);
 			return err;
@@ -2832,7 +2849,8 @@ add_timeline_fence_array(struct i915_execbuffer *eb,
 			 * 0) would break the timeline.
 			 */
 			if (user_fence.flags & I915_EXEC_FENCE_WAIT) {
-				DRM_DEBUG("Trying to wait & signal the same timeline point.\n");
+				drm_dbg(&eb->i915->drm,
+					"Trying to wait & signal the same timeline point.\n");
 				dma_fence_put(fence);
 				drm_syncobj_put(syncobj);
 				return -EINVAL;
@@ -2903,14 +2921,16 @@ static int add_fence_array(struct i915_execbuffer *eb)
 
 		syncobj = drm_syncobj_find(eb->file, user_fence.handle);
 		if (!syncobj) {
-			DRM_DEBUG("Invalid syncobj handle provided\n");
+			drm_dbg(&eb->i915->drm,
+				"Invalid syncobj handle provided\n");
 			return -ENOENT;
 		}
 
 		if (user_fence.flags & I915_EXEC_FENCE_WAIT) {
 			fence = drm_syncobj_fence_get(syncobj);
 			if (!fence) {
-				DRM_DEBUG("Syncobj handle has no fence\n");
+				drm_dbg(&eb->i915->drm,
+					"Syncobj handle has no fence\n");
 				drm_syncobj_put(syncobj);
 				return -EINVAL;
 			}
@@ -2944,11 +2964,6 @@ await_fence_array(struct i915_execbuffer *eb,
 	int err;
 
 	for (n = 0; n < eb->num_fences; n++) {
-		struct drm_syncobj *syncobj;
-		unsigned int flags;
-
-		syncobj = ptr_unpack_bits(eb->fences[n].syncobj, &flags, 2);
-
 		if (!eb->fences[n].dma_fence)
 			continue;
 
@@ -3406,7 +3421,9 @@ i915_gem_do_execbuffer(struct drm_device *dev,
 	}
 
 	ww_acquire_done(&eb.ww.ctx);
-	eb_capture_stage(&eb);
+	err = eb_capture_stage(&eb);
+	if (err)
+		goto err_vma;
 
 	out_fence = eb_requests_create(&eb, in_fence, out_fence_fd);
 	if (IS_ERR(out_fence)) {
@@ -3508,7 +3525,7 @@ i915_gem_execbuffer2_ioctl(struct drm_device *dev, void *data,
 		return -EINVAL;
 	}
 
-	err = i915_gem_check_execbuffer(args);
+	err = i915_gem_check_execbuffer(i915, args);
 	if (err)
 		return err;
 

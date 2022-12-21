@@ -91,7 +91,7 @@ static size_t sigframe_size(struct rt_sigframe_user_layout const *user)
  * not taken into account.  This limit is not a guarantee and is
  * NOT ABI.
  */
-#define SIGFRAME_MAXSZ SZ_64K
+#define SIGFRAME_MAXSZ SZ_256K
 
 static int __sigframe_alloc(struct rt_sigframe_user_layout *user,
 			    unsigned long *offset, size_t size, bool extend)
@@ -207,6 +207,7 @@ static int restore_fpsimd_context(struct fpsimd_context __user *ctx)
 	__get_user_error(fpsimd.fpcr, &ctx->fpcr, err);
 
 	clear_thread_flag(TIF_SVE);
+	current->thread.fp_type = FP_STATE_FPSIMD;
 
 	/* load the hardware registers from the fpsimd_state structure */
 	if (!err)
@@ -280,6 +281,9 @@ static int restore_sve_fpsimd_context(struct user_ctxs *user)
 
 		vl = task_get_sme_vl(current);
 	} else {
+		if (!system_supports_sve())
+			return -EINVAL;
+
 		vl = task_get_sve_vl(current);
 	}
 
@@ -289,6 +293,7 @@ static int restore_sve_fpsimd_context(struct user_ctxs *user)
 	if (sve.head.size <= sizeof(*user->sve)) {
 		clear_thread_flag(TIF_SVE);
 		current->thread.svcr &= ~SVCR_SM_MASK;
+		current->thread.fp_type = FP_STATE_FPSIMD;
 		goto fpsimd_only;
 	}
 
@@ -307,7 +312,7 @@ static int restore_sve_fpsimd_context(struct user_ctxs *user)
 	fpsimd_flush_task_state(current);
 	/* From now, fpsimd_thread_switch() won't touch thread.sve_state */
 
-	sve_alloc(current);
+	sve_alloc(current, true);
 	if (!current->thread.sve_state) {
 		clear_thread_flag(TIF_SVE);
 		return -ENOMEM;
@@ -324,6 +329,7 @@ static int restore_sve_fpsimd_context(struct user_ctxs *user)
 		current->thread.svcr |= SVCR_SM_MASK;
 	else
 		set_thread_flag(TIF_SVE);
+	current->thread.fp_type = FP_STATE_SVE;
 
 fpsimd_only:
 	/* copy the FP and status/control registers */
@@ -342,9 +348,14 @@ fpsimd_only:
 
 #else /* ! CONFIG_ARM64_SVE */
 
-/* Turn any non-optimised out attempts to use these into a link error: */
+static int restore_sve_fpsimd_context(struct user_ctxs *user)
+{
+	WARN_ON_ONCE(1);
+	return -EINVAL;
+}
+
+/* Turn any non-optimised out attempts to use this into a link error: */
 extern int preserve_sve_context(void __user *ctx);
-extern int restore_sve_fpsimd_context(struct user_ctxs *user);
 
 #endif /* ! CONFIG_ARM64_SVE */
 
@@ -385,7 +396,7 @@ static int preserve_za_context(struct za_context __user *ctx)
 	return err ? -EFAULT : 0;
 }
 
-static int restore_za_context(struct user_ctxs __user *user)
+static int restore_za_context(struct user_ctxs *user)
 {
 	int err;
 	unsigned int vq;
@@ -649,14 +660,10 @@ static int restore_sigframe(struct pt_regs *regs,
 		if (!user.fpsimd)
 			return -EINVAL;
 
-		if (user.sve) {
-			if (!system_supports_sve())
-				return -EINVAL;
-
+		if (user.sve)
 			err = restore_sve_fpsimd_context(&user);
-		} else {
+		else
 			err = restore_fpsimd_context(user.fpsimd);
-		}
 	}
 
 	if (err == 0 && system_supports_sme() && user.za)
@@ -922,6 +929,18 @@ static void setup_return(struct pt_regs *regs, struct k_sigaction *ka,
 
 	/* Signal handlers are invoked with ZA and streaming mode disabled */
 	if (system_supports_sme()) {
+		/*
+		 * If we were in streaming mode the saved register
+		 * state was SVE but we will exit SM and use the
+		 * FPSIMD register state - flush the saved FPSIMD
+		 * register state in case it gets loaded.
+		 */
+		if (current->thread.svcr & SVCR_SM_MASK) {
+			memset(&current->thread.uw.fpsimd_state, 0,
+			       sizeof(current->thread.uw.fpsimd_state));
+			current->thread.fp_type = FP_STATE_FPSIMD;
+		}
+
 		current->thread.svcr &= ~(SVCR_ZA_MASK |
 					  SVCR_SM_MASK);
 		sme_smstop();
@@ -1179,6 +1198,7 @@ static_assert(offsetof(siginfo_t, si_upper)	== 0x28);
 static_assert(offsetof(siginfo_t, si_pkey)	== 0x20);
 static_assert(offsetof(siginfo_t, si_perf_data)	== 0x18);
 static_assert(offsetof(siginfo_t, si_perf_type)	== 0x20);
+static_assert(offsetof(siginfo_t, si_perf_flags) == 0x24);
 static_assert(offsetof(siginfo_t, si_band)	== 0x10);
 static_assert(offsetof(siginfo_t, si_fd)	== 0x18);
 static_assert(offsetof(siginfo_t, si_call_addr)	== 0x10);

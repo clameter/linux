@@ -102,8 +102,18 @@ static inline unsigned long wb_stat_error(void)
 #endif
 }
 
+/* BDI ratio is expressed as part per 1000000 for finer granularity. */
+#define BDI_RATIO_SCALE 10000
+
+u64 bdi_get_min_bytes(struct backing_dev_info *bdi);
+u64 bdi_get_max_bytes(struct backing_dev_info *bdi);
 int bdi_set_min_ratio(struct backing_dev_info *bdi, unsigned int min_ratio);
 int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
+int bdi_set_min_ratio_no_scale(struct backing_dev_info *bdi, unsigned int min_ratio);
+int bdi_set_max_ratio_no_scale(struct backing_dev_info *bdi, unsigned int max_ratio);
+int bdi_set_min_bytes(struct backing_dev_info *bdi, u64 min_bytes);
+int bdi_set_max_bytes(struct backing_dev_info *bdi, u64 max_bytes);
+int bdi_set_strict_limit(struct backing_dev_info *bdi, unsigned int strict_limit);
 
 /*
  * Flags in backing_dev_info::capability
@@ -118,6 +128,8 @@ int bdi_set_max_ratio(struct backing_dev_info *bdi, unsigned int max_ratio);
 #define BDI_CAP_STRICTLIMIT		(1 << 2)
 
 extern struct backing_dev_info noop_backing_dev_info;
+
+int bdi_init(struct backing_dev_info *bdi);
 
 /**
  * writeback_in_progress - determine whether there is writeback in progress
@@ -136,12 +148,6 @@ struct backing_dev_info *inode_to_bdi(struct inode *inode);
 static inline bool mapping_can_writeback(struct address_space *mapping)
 {
 	return inode_to_bdi(mapping->host)->capabilities & BDI_CAP_WRITEBACK;
-}
-
-static inline int bdi_sched_wait(void *word)
-{
-	schedule();
-	return 0;
 }
 
 #ifdef CONFIG_CGROUP_WRITEBACK
@@ -231,18 +237,6 @@ wb_get_create_current(struct backing_dev_info *bdi, gfp_t gfp)
 		css_put(memcg_css);
 	}
 	return wb;
-}
-
-/**
- * inode_to_wb_is_valid - test whether an inode has a wb associated
- * @inode: inode of interest
- *
- * Returns %true if @inode has a wb associated.  May be called without any
- * locking.
- */
-static inline bool inode_to_wb_is_valid(struct inode *inode)
-{
-	return inode->i_wb;
 }
 
 /**
@@ -341,11 +335,6 @@ static inline struct bdi_writeback *
 wb_get_create_current(struct backing_dev_info *bdi, gfp_t gfp)
 {
 	return &bdi->wb;
-}
-
-static inline bool inode_to_wb_is_valid(struct inode *inode)
-{
-	return true;
 }
 
 static inline struct bdi_writeback *inode_to_wb(struct inode *inode)
